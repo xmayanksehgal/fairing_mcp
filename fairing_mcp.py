@@ -1,4 +1,5 @@
 import os
+import sys
 import re
 from datetime import datetime, timezone
 from collections import defaultdict
@@ -12,10 +13,147 @@ FAIRING_API_KEY = os.environ.get("FAIRING_API_KEY")
 BASE_URL = "https://app.fairing.co/api"
 HEADERS = {"Authorization": FAIRING_API_KEY, "Accept": "application/json"}
 
-MAIN_QUESTION_ID = 32778
-YOUTUBE_CLARIFICATION_QUESTION_ID = 145964
-PODCAST_CLARIFICATION_QUESTION_ID = 145963
-INSTAGRAM_CLARIFICATION_QUESTION_ID = int(os.environ.get("INSTAGRAM_CLARIFICATION_QUESTION_ID", "146913"))
+# ---------------------------------------------------------------------------
+# Question ID discovery
+# ---------------------------------------------------------------------------
+# Question IDs are auto-discovered from GET /api/questions at startup.
+# Any ID can be overridden via environment variable (highest priority).
+# Priority: ENV_VAR > auto_discovered > None
+
+_MAIN_QUESTION_PATTERNS = [
+    "how did you hear",
+    "how did you find",
+    "how did you discover",
+    "where did you hear",
+    "where did you find",
+]
+
+_CLARIFICATION_KEYWORDS = {
+    "youtube": "youtube",
+    "podcast": "podcast",
+    "instagram": "instagram",
+}
+
+
+def _discover_question_ids() -> dict:
+    """
+    Fetch GET /api/questions and discover question IDs by matching prompt/response text.
+    Always returns a dict — never raises.
+    """
+    result = {
+        "main_question_id": None,
+        "youtube_clarification_id": None,
+        "podcast_clarification_id": None,
+        "instagram_clarification_id": None,
+        "warnings": [],
+        "error": None,
+    }
+
+    if not FAIRING_API_KEY:
+        result["error"] = "FAIRING_API_KEY not set; cannot auto-discover question IDs."
+        return result
+
+    try:
+        resp = requests.get(f"{BASE_URL}/questions", headers=HEADERS, timeout=10)
+        resp.raise_for_status()
+        questions = resp.json().get("data", [])
+    except Exception as exc:
+        result["error"] = f"Auto-discovery failed: {exc}"
+        return result
+
+    if not questions:
+        result["warnings"].append(
+            "GET /api/questions returned no questions. Check API key permissions."
+        )
+        return result
+
+    # Find the main attribution question — prefer the one with the most response options
+    candidates = [
+        q for q in questions
+        if any(p in (q.get("prompt") or "").lower() for p in _MAIN_QUESTION_PATTERNS)
+    ]
+    if not candidates:
+        result["warnings"].append(
+            f"No question matched attribution patterns {_MAIN_QUESTION_PATTERNS}. "
+            "Set MAIN_QUESTION_ID env var to override."
+        )
+        return result
+
+    if len(candidates) > 1:
+        result["warnings"].append(
+            f"Found {len(candidates)} questions matching attribution patterns; "
+            "using the one with the most response options. Set MAIN_QUESTION_ID to override."
+        )
+
+    main_q = max(candidates, key=lambda q: len(q.get("responses") or []))
+    result["main_question_id"] = int(main_q["id"])
+
+    # Scan response options for clarification question IDs
+    for option in (main_q.get("responses") or []):
+        value = (option.get("value") or "").lower()
+        clarif = option.get("clarification_question")
+        if not clarif:
+            continue
+        try:
+            clarif_id = int(clarif["id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        for keyword, platform in _CLARIFICATION_KEYWORDS.items():
+            if keyword in value:
+                id_key = f"{platform}_clarification_id"
+                if result[id_key] is None:
+                    result[id_key] = clarif_id
+
+    # Warn about anything we couldn't find
+    for platform in ("youtube", "podcast", "instagram"):
+        if result[f"{platform}_clarification_id"] is None:
+            result["warnings"].append(
+                f"No response option containing '{platform}' found on main question. "
+                f"Set {platform.upper()}_CLARIFICATION_QUESTION_ID env var to override."
+            )
+
+    return result
+
+
+def _resolve_question_id(env_var: str, discovered) -> "int | None":
+    """Return env var (if set and valid int) > discovered > None."""
+    env_val = os.environ.get(env_var)
+    if env_val is not None:
+        try:
+            return int(env_val)
+        except ValueError:
+            print(
+                f"[fairing_mcp] WARNING: {env_var}={env_val!r} is not a valid integer; ignoring.",
+                file=sys.stderr,
+            )
+    return discovered
+
+
+_discovery = _discover_question_ids()
+
+if _discovery["error"]:
+    print(f"[fairing_mcp] WARNING: {_discovery['error']}", file=sys.stderr)
+for _w in _discovery["warnings"]:
+    print(f"[fairing_mcp] WARNING: {_w}", file=sys.stderr)
+
+MAIN_QUESTION_ID = _resolve_question_id("MAIN_QUESTION_ID", _discovery["main_question_id"])
+YOUTUBE_CLARIFICATION_QUESTION_ID = _resolve_question_id(
+    "YOUTUBE_CLARIFICATION_QUESTION_ID", _discovery["youtube_clarification_id"]
+)
+PODCAST_CLARIFICATION_QUESTION_ID = _resolve_question_id(
+    "PODCAST_CLARIFICATION_QUESTION_ID", _discovery["podcast_clarification_id"]
+)
+INSTAGRAM_CLARIFICATION_QUESTION_ID = _resolve_question_id(
+    "INSTAGRAM_CLARIFICATION_QUESTION_ID", _discovery["instagram_clarification_id"]
+)
+
+if MAIN_QUESTION_ID is None:
+    print(
+        "[fairing_mcp] ERROR: MAIN_QUESTION_ID could not be determined. "
+        "Most tools will be unavailable. Set MAIN_QUESTION_ID env var to fix.",
+        file=sys.stderr,
+    )
 
 # Response rates — update these based on your actual data.
 # main_question_rate: % of all orders that answer the main "how did you hear" question
@@ -183,6 +321,19 @@ def _matches_channel(query: str, response_text: str) -> bool:
     return False
 
 
+def _require_question_id(env_var: str, question_id) -> "dict | None":
+    """Return an error dict if question_id is None, else None."""
+    if question_id is not None:
+        return None
+    return {
+        "error": (
+            f"{env_var} could not be determined. "
+            "Auto-discovery may have failed or your Fairing survey structure doesn't match "
+            "expected patterns. Set the environment variable to override."
+        )
+    }
+
+
 # ---------------------------------------------------------------------------
 # Tool: get_other_responses
 # ---------------------------------------------------------------------------
@@ -210,9 +361,19 @@ def get_other_responses(
         "podcast": PODCAST_CLARIFICATION_QUESTION_ID,
         "instagram": INSTAGRAM_CLARIFICATION_QUESTION_ID,
     }
-    qid = question_map.get(question)
-    if not qid:
+    if question not in question_map:
         return {"error": f"Unknown question '{question}'. Use: main, youtube, podcast, instagram"}
+
+    _env_var_names = {
+        "main": "MAIN_QUESTION_ID",
+        "youtube": "YOUTUBE_CLARIFICATION_QUESTION_ID",
+        "podcast": "PODCAST_CLARIFICATION_QUESTION_ID",
+        "instagram": "INSTAGRAM_CLARIFICATION_QUESTION_ID",
+    }
+    qid = question_map[question]
+    err = _require_question_id(_env_var_names[question], qid)
+    if err:
+        return err
 
     responses, fetch_meta = fetch_all_responses(qid, after_date, before_date, debug=debug)
 
@@ -277,6 +438,10 @@ def get_attribution_overview(
             Example: {"main_question": 0.25}
         debug: If True, include pagination metadata
     """
+    err = _require_question_id("MAIN_QUESTION_ID", MAIN_QUESTION_ID)
+    if err:
+        return err
+
     rates = _resolve_rates(rate_overrides)
     main_rate = rates["main_question"]
 
@@ -338,6 +503,10 @@ def rank_youtube_channels(
         rate_overrides: Optional dict to override response rates for this call only
         debug: If True, include pagination metadata
     """
+    err = _require_question_id("YOUTUBE_CLARIFICATION_QUESTION_ID", YOUTUBE_CLARIFICATION_QUESTION_ID)
+    if err:
+        return err
+
     rates = _resolve_rates(rate_overrides)
     compound = _compound_rate(rates, "main_question", "youtube_clarification")
 
@@ -441,6 +610,13 @@ def get_channel_performance(
         rate_overrides: Optional dict to override response rates for this call only
         debug: If True, include pagination metadata
     """
+    err = _require_question_id("YOUTUBE_CLARIFICATION_QUESTION_ID", YOUTUBE_CLARIFICATION_QUESTION_ID)
+    if err:
+        return err
+    err = _require_question_id("MAIN_QUESTION_ID", MAIN_QUESTION_ID)
+    if err:
+        return err
+
     rates = _resolve_rates(rate_overrides)
     compound = _compound_rate(rates, "main_question", "youtube_clarification")
     main_rate = rates["main_question"]
@@ -582,6 +758,10 @@ def rank_podcast_channels(
         rate_overrides: Optional dict to override response rates for this call only
         debug: If True, include pagination metadata
     """
+    err = _require_question_id("PODCAST_CLARIFICATION_QUESTION_ID", PODCAST_CLARIFICATION_QUESTION_ID)
+    if err:
+        return err
+
     rates = _resolve_rates(rate_overrides)
     compound = _compound_rate(rates, "main_question", "podcast_clarification")
 
@@ -685,6 +865,13 @@ def get_podcast_performance(
         rate_overrides: Optional dict to override response rates for this call only
         debug: If True, include pagination metadata
     """
+    err = _require_question_id("PODCAST_CLARIFICATION_QUESTION_ID", PODCAST_CLARIFICATION_QUESTION_ID)
+    if err:
+        return err
+    err = _require_question_id("MAIN_QUESTION_ID", MAIN_QUESTION_ID)
+    if err:
+        return err
+
     rates = _resolve_rates(rate_overrides)
     compound = _compound_rate(rates, "main_question", "podcast_clarification")
     main_rate = rates["main_question"]
@@ -824,11 +1011,9 @@ def rank_instagram_channels(
         rate_overrides: Optional dict to override response rates for this call only
         debug: If True, include pagination metadata
     """
-    if not INSTAGRAM_CLARIFICATION_QUESTION_ID:
-        return {
-            "error": "INSTAGRAM_CLARIFICATION_QUESTION_ID is not set. Create an Instagram clarification "
-                     "question in Fairing and set the ID via the INSTAGRAM_CLARIFICATION_QUESTION_ID env var."
-        }
+    err = _require_question_id("INSTAGRAM_CLARIFICATION_QUESTION_ID", INSTAGRAM_CLARIFICATION_QUESTION_ID)
+    if err:
+        return err
 
     rates = _resolve_rates(rate_overrides)
     compound = _compound_rate(rates, "main_question", "instagram_clarification")
@@ -934,11 +1119,12 @@ def get_instagram_channel_performance(
         rate_overrides: Optional dict to override response rates for this call only
         debug: If True, include pagination metadata
     """
-    if not INSTAGRAM_CLARIFICATION_QUESTION_ID:
-        return {
-            "error": "INSTAGRAM_CLARIFICATION_QUESTION_ID is not set. Create an Instagram clarification "
-                     "question in Fairing and set the ID via the INSTAGRAM_CLARIFICATION_QUESTION_ID env var."
-        }
+    err = _require_question_id("INSTAGRAM_CLARIFICATION_QUESTION_ID", INSTAGRAM_CLARIFICATION_QUESTION_ID)
+    if err:
+        return err
+    err = _require_question_id("MAIN_QUESTION_ID", MAIN_QUESTION_ID)
+    if err:
+        return err
 
     rates = _resolve_rates(rate_overrides)
     compound = _compound_rate(rates, "main_question", "instagram_clarification")
@@ -1087,18 +1273,21 @@ def get_creator_performance(
         {
             "platform": "youtube",
             "question_id": YOUTUBE_CLARIFICATION_QUESTION_ID,
+            "env_var": "YOUTUBE_CLARIFICATION_QUESTION_ID",
             "rate_keys": ("main_question", "youtube_clarification"),
             "compound_key": "youtube_clarification",
         },
         {
             "platform": "podcast",
             "question_id": PODCAST_CLARIFICATION_QUESTION_ID,
+            "env_var": "PODCAST_CLARIFICATION_QUESTION_ID",
             "rate_keys": ("main_question", "podcast_clarification"),
             "compound_key": "podcast_clarification",
         },
         {
             "platform": "instagram",
             "question_id": INSTAGRAM_CLARIFICATION_QUESTION_ID,
+            "env_var": "INSTAGRAM_CLARIFICATION_QUESTION_ID",
             "rate_keys": ("main_question", "instagram_clarification"),
             "compound_key": "instagram_clarification",
         },
@@ -1111,6 +1300,17 @@ def get_creator_performance(
     all_fetch_metas = {}
 
     for cfg in platform_configs:
+        if cfg["question_id"] is None:
+            platforms[cfg["platform"]] = {
+                "found": False,
+                "skipped": True,
+                "reason": (
+                    f"{cfg['env_var']} could not be determined. "
+                    f"Set {cfg['env_var']} env var to enable this platform."
+                ),
+            }
+            continue
+
         compound = _compound_rate(rates, *cfg["rate_keys"])
         responses, fetch_meta = fetch_all_responses(
             cfg["question_id"], after_date, before_date, debug=debug
