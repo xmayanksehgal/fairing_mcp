@@ -18,7 +18,8 @@ Single-file implementation: `fairing_mcp.py`
 
 ```
 fairing_mcp.py
-├── Constants & config          # Question IDs, response rates, API base URL
+├── Constants & config          # Response rates, API base URL
+├── Question ID discovery       # _discover_question_ids, auto-resolves IDs from /api/questions
 ├── Internal helpers            # _resolve_rates, _compound_rate, _extrapolate, fetch_all_responses
 ├── Channel matching            # _normalize, _matches (fuzzy + exact match)
 └── MCP Tools (9 exported)
@@ -49,15 +50,21 @@ fairing_mcp.py
 | `YOUTUBE_CLARIFICATION_RESPONSE_RATE` | `0.55` | % of YouTube respondents who answer the clarification follow-up |
 | `PODCAST_CLARIFICATION_RESPONSE_RATE` | `0.80` | % of Podcast respondents who answer the clarification follow-up |
 | `INSTAGRAM_CLARIFICATION_RESPONSE_RATE` | `0.80` | % of Instagram respondents who answer the clarification follow-up |
-| `INSTAGRAM_CLARIFICATION_QUESTION_ID` | `146913` | Fairing question ID for the Instagram clarification question |
 
-### Hardcoded question IDs (edit in source if yours differ)
+### Question ID overrides (usually not needed)
 
-| Constant | Value | Purpose |
-|---|---|---|
-| `MAIN_QUESTION_ID` | `32778` | "How did you hear about us?" |
-| `YOUTUBE_CLARIFICATION_QUESTION_ID` | `145964` | "Which YouTube channel?" |
-| `PODCAST_CLARIFICATION_QUESTION_ID` | `145963` | "Which podcast?" |
+Question IDs are **auto-discovered** at startup from `GET /api/questions`. The server identifies the main attribution question by matching its prompt text ("how did you hear", "how did you find", etc.) and finds YouTube/Podcast/Instagram clarification IDs by inspecting the nested response options.
+
+If auto-discovery doesn't work for your survey structure (e.g. your question uses different phrasing), you can override any ID via environment variable:
+
+| Variable | Purpose |
+|---|---|
+| `MAIN_QUESTION_ID` | Override the main "how did you hear about us?" question ID |
+| `YOUTUBE_CLARIFICATION_QUESTION_ID` | Override the YouTube clarification question ID |
+| `PODCAST_CLARIFICATION_QUESTION_ID` | Override the Podcast clarification question ID |
+| `INSTAGRAM_CLARIFICATION_QUESTION_ID` | Override the Instagram clarification question ID |
+
+Startup warnings are printed to stderr if any IDs can't be discovered. Check your MCP server logs if a tool returns an error about a missing question ID.
 
 ## Setup
 
