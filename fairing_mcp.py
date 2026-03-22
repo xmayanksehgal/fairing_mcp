@@ -7,7 +7,7 @@ import statistics
 import requests
 from mcp.server.fastmcp import FastMCP
 
-mcp = FastMCP("Fairing")
+mcp = FastMCP("Fairing", stateless_http=True)
 
 FAIRING_API_KEY = os.environ.get("FAIRING_API_KEY")
 BASE_URL = "https://app.fairing.co/api"
@@ -1392,4 +1392,4 @@ def get_creator_performance(
 
 
 if __name__ == "__main__":
-    mcp.run()
+    mcp.run(transport="streamable-http")
