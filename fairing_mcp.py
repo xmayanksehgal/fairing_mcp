@@ -5,13 +5,26 @@ from datetime import datetime, timezone
 from collections import defaultdict
 import statistics
 import requests
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Context
 
 mcp = FastMCP("Fairing", stateless_http=True)
 
 FAIRING_API_KEY = os.environ.get("FAIRING_API_KEY")
 BASE_URL = "https://app.fairing.co/api"
-HEADERS = {"Authorization": FAIRING_API_KEY, "Accept": "application/json"}
+
+
+def _make_headers(api_key: str) -> dict:
+    """Build request headers for the Fairing API."""
+    return {"Authorization": api_key, "Accept": "application/json"}
+
+
+def _get_api_key(ctx: Context = None) -> str:
+    """Extract API key from MCP request headers, falling back to env var."""
+    if ctx and ctx.request_context and ctx.request_context.request:
+        auth = ctx.request_context.request.headers.get("authorization", "")
+        if auth:
+            return auth
+    return os.environ.get("FAIRING_API_KEY", "")
 
 # ---------------------------------------------------------------------------
 # Question ID discovery
@@ -35,7 +48,7 @@ _CLARIFICATION_KEYWORDS = {
 }
 
 
-def _discover_question_ids() -> dict:
+def _discover_question_ids(api_key: str = None) -> dict:
     """
     Fetch GET /api/questions and discover question IDs by matching prompt/response text.
     Always returns a dict — never raises.
@@ -49,12 +62,13 @@ def _discover_question_ids() -> dict:
         "error": None,
     }
 
-    if not FAIRING_API_KEY:
+    key = api_key or FAIRING_API_KEY
+    if not key:
         result["error"] = "FAIRING_API_KEY not set; cannot auto-discover question IDs."
         return result
 
     try:
-        resp = requests.get(f"{BASE_URL}/questions", headers=HEADERS, timeout=10)
+        resp = requests.get(f"{BASE_URL}/questions", headers=_make_headers(key), timeout=10)
         resp.raise_for_status()
         questions = resp.json().get("data", [])
     except Exception as exc:
@@ -155,6 +169,32 @@ if MAIN_QUESTION_ID is None:
         file=sys.stderr,
     )
 
+# Cache discovered question IDs per API key to avoid repeated discovery calls.
+_question_id_cache: dict[str, dict] = {}
+
+# Seed cache with env var key results (if available).
+if FAIRING_API_KEY:
+    _question_id_cache[FAIRING_API_KEY] = {
+        "main_question_id": MAIN_QUESTION_ID,
+        "youtube_clarification_id": YOUTUBE_CLARIFICATION_QUESTION_ID,
+        "podcast_clarification_id": PODCAST_CLARIFICATION_QUESTION_ID,
+        "instagram_clarification_id": INSTAGRAM_CLARIFICATION_QUESTION_ID,
+    }
+
+
+def _get_question_ids(api_key: str) -> dict:
+    """Return discovered question IDs for the given API key, with caching."""
+    if api_key not in _question_id_cache:
+        disc = _discover_question_ids(api_key)
+        _question_id_cache[api_key] = {
+            "main_question_id": _resolve_question_id("MAIN_QUESTION_ID", disc["main_question_id"]),
+            "youtube_clarification_id": _resolve_question_id("YOUTUBE_CLARIFICATION_QUESTION_ID", disc["youtube_clarification_id"]),
+            "podcast_clarification_id": _resolve_question_id("PODCAST_CLARIFICATION_QUESTION_ID", disc["podcast_clarification_id"]),
+            "instagram_clarification_id": _resolve_question_id("INSTAGRAM_CLARIFICATION_QUESTION_ID", disc["instagram_clarification_id"]),
+        }
+    return _question_id_cache[api_key]
+
+
 # Response rates — update these based on your actual data.
 # main_question_rate: % of all orders that answer the main "how did you hear" question
 # youtube_clarification_rate: % of main-question YouTube respondents who answer the clarification
@@ -201,6 +241,7 @@ def fetch_all_responses(
     after_date: str = None,
     before_date: str = None,
     debug: bool = False,
+    api_key: str = None,
 ) -> tuple[list, dict]:
     """
     Paginate through all responses with optional date filtering.
@@ -212,6 +253,7 @@ def fetch_all_responses(
     all_responses = []
     url = f"{BASE_URL}/responses"
     params = {"limit": 100, "question_id": question_id}
+    headers = _make_headers(api_key or FAIRING_API_KEY or "")
 
     after_dt = datetime.fromisoformat(after_date).replace(tzinfo=timezone.utc) if after_date else None
     before_dt = datetime.fromisoformat(before_date).replace(tzinfo=timezone.utc) if before_date else None
@@ -222,7 +264,7 @@ def fetch_all_responses(
     latest_ts = None
 
     while url:
-        resp = requests.get(url, headers=HEADERS, params=params)
+        resp = requests.get(url, headers=headers, params=params)
         resp.raise_for_status()
         data = resp.json()
         api_calls += 1
@@ -344,6 +386,7 @@ def get_other_responses(
     before_date: str = None,
     question: str = "main",
     debug: bool = False,
+    ctx: Context = None,
 ) -> dict:
     """
     Return full free-text "Other" responses so you can identify channels
@@ -355,11 +398,16 @@ def get_other_responses(
         question: Which question to inspect — "main", "youtube", "podcast", or "instagram"
         debug: If True, include pagination metadata
     """
+    api_key = _get_api_key(ctx)
+    if not api_key:
+        return {"error": "No API key provided. Pass via Authorization header or set FAIRING_API_KEY env var."}
+    ids = _get_question_ids(api_key)
+
     question_map = {
-        "main": MAIN_QUESTION_ID,
-        "youtube": YOUTUBE_CLARIFICATION_QUESTION_ID,
-        "podcast": PODCAST_CLARIFICATION_QUESTION_ID,
-        "instagram": INSTAGRAM_CLARIFICATION_QUESTION_ID,
+        "main": ids["main_question_id"],
+        "youtube": ids["youtube_clarification_id"],
+        "podcast": ids["podcast_clarification_id"],
+        "instagram": ids["instagram_clarification_id"],
     }
     if question not in question_map:
         return {"error": f"Unknown question '{question}'. Use: main, youtube, podcast, instagram"}
@@ -375,7 +423,7 @@ def get_other_responses(
     if err:
         return err
 
-    responses, fetch_meta = fetch_all_responses(qid, after_date, before_date, debug=debug)
+    responses, fetch_meta = fetch_all_responses(qid, after_date, before_date, debug=debug, api_key=api_key)
 
     # Collect records where the response is "Other" or where other_response is populated
     other_records = [
@@ -425,6 +473,7 @@ def get_attribution_overview(
     before_date: str = None,
     rate_overrides: dict = None,
     debug: bool = False,
+    ctx: Context = None,
 ) -> dict:
     """
     Get a high-level breakdown of all discovery channels with mention counts,
@@ -438,14 +487,19 @@ def get_attribution_overview(
             Example: {"main_question": 0.25}
         debug: If True, include pagination metadata
     """
-    err = _require_question_id("MAIN_QUESTION_ID", MAIN_QUESTION_ID)
+    api_key = _get_api_key(ctx)
+    if not api_key:
+        return {"error": "No API key provided. Pass via Authorization header or set FAIRING_API_KEY env var."}
+    ids = _get_question_ids(api_key)
+
+    err = _require_question_id("MAIN_QUESTION_ID", ids["main_question_id"])
     if err:
         return err
 
     rates = _resolve_rates(rate_overrides)
     main_rate = rates["main_question"]
 
-    responses, fetch_meta = fetch_all_responses(MAIN_QUESTION_ID, after_date, before_date, debug=debug)
+    responses, fetch_meta = fetch_all_responses(ids["main_question_id"], after_date, before_date, debug=debug, api_key=api_key)
 
     channel_stats = defaultdict(lambda: {"mentions": 0, "revenue": 0.0})
     for r in responses:
@@ -493,6 +547,7 @@ def rank_youtube_channels(
     include_monthly_trend: bool = False,
     rate_overrides: dict = None,
     debug: bool = False,
+    ctx: Context = None,
 ) -> dict:
     """
     Rank all YouTube channels by number of mentions or attributed revenue.
@@ -503,7 +558,12 @@ def rank_youtube_channels(
         rate_overrides: Optional dict to override response rates for this call only
         debug: If True, include pagination metadata
     """
-    err = _require_question_id("YOUTUBE_CLARIFICATION_QUESTION_ID", YOUTUBE_CLARIFICATION_QUESTION_ID)
+    api_key = _get_api_key(ctx)
+    if not api_key:
+        return {"error": "No API key provided. Pass via Authorization header or set FAIRING_API_KEY env var."}
+    ids = _get_question_ids(api_key)
+
+    err = _require_question_id("YOUTUBE_CLARIFICATION_QUESTION_ID", ids["youtube_clarification_id"])
     if err:
         return err
 
@@ -511,7 +571,7 @@ def rank_youtube_channels(
     compound = _compound_rate(rates, "main_question", "youtube_clarification")
 
     responses, fetch_meta = fetch_all_responses(
-        YOUTUBE_CLARIFICATION_QUESTION_ID, after_date, before_date, debug=debug
+        ids["youtube_clarification_id"], after_date, before_date, debug=debug, api_key=api_key
     )
 
     channel_stats: dict[str, dict] = defaultdict(lambda: {"mentions": 0, "revenue": 0.0, "by_month": defaultdict(lambda: {"mentions": 0, "revenue": 0.0})})
@@ -595,6 +655,7 @@ def get_channel_performance(
     before_date: str = None,
     rate_overrides: dict = None,
     debug: bool = False,
+    ctx: Context = None,
 ) -> dict:
     """
     Get performance stats for a specific YouTube channel.
@@ -610,10 +671,15 @@ def get_channel_performance(
         rate_overrides: Optional dict to override response rates for this call only
         debug: If True, include pagination metadata
     """
-    err = _require_question_id("YOUTUBE_CLARIFICATION_QUESTION_ID", YOUTUBE_CLARIFICATION_QUESTION_ID)
+    api_key = _get_api_key(ctx)
+    if not api_key:
+        return {"error": "No API key provided. Pass via Authorization header or set FAIRING_API_KEY env var."}
+    ids = _get_question_ids(api_key)
+
+    err = _require_question_id("YOUTUBE_CLARIFICATION_QUESTION_ID", ids["youtube_clarification_id"])
     if err:
         return err
-    err = _require_question_id("MAIN_QUESTION_ID", MAIN_QUESTION_ID)
+    err = _require_question_id("MAIN_QUESTION_ID", ids["main_question_id"])
     if err:
         return err
 
@@ -623,7 +689,7 @@ def get_channel_performance(
 
     # --- Source 1: YouTube clarification question ---
     yt_responses, yt_meta = fetch_all_responses(
-        YOUTUBE_CLARIFICATION_QUESTION_ID, after_date, before_date, debug=debug
+        ids["youtube_clarification_id"], after_date, before_date, debug=debug, api_key=api_key
     )
     all_aovs = [float(r["order_total"]) for r in yt_responses if r.get("order_total")]
     yt_matches = [
@@ -634,7 +700,7 @@ def get_channel_performance(
 
     # --- Source 2: Main question "Other" free-text ---
     main_responses, main_meta = fetch_all_responses(
-        MAIN_QUESTION_ID, after_date, before_date, debug=debug
+        ids["main_question_id"], after_date, before_date, debug=debug, api_key=api_key
     )
     main_other_matches = [
         r for r in main_responses
@@ -748,6 +814,7 @@ def rank_podcast_channels(
     include_monthly_trend: bool = False,
     rate_overrides: dict = None,
     debug: bool = False,
+    ctx: Context = None,
 ) -> dict:
     """
     Rank all podcasts by number of mentions or attributed revenue.
@@ -758,7 +825,12 @@ def rank_podcast_channels(
         rate_overrides: Optional dict to override response rates for this call only
         debug: If True, include pagination metadata
     """
-    err = _require_question_id("PODCAST_CLARIFICATION_QUESTION_ID", PODCAST_CLARIFICATION_QUESTION_ID)
+    api_key = _get_api_key(ctx)
+    if not api_key:
+        return {"error": "No API key provided. Pass via Authorization header or set FAIRING_API_KEY env var."}
+    ids = _get_question_ids(api_key)
+
+    err = _require_question_id("PODCAST_CLARIFICATION_QUESTION_ID", ids["podcast_clarification_id"])
     if err:
         return err
 
@@ -766,7 +838,7 @@ def rank_podcast_channels(
     compound = _compound_rate(rates, "main_question", "podcast_clarification")
 
     responses, fetch_meta = fetch_all_responses(
-        PODCAST_CLARIFICATION_QUESTION_ID, after_date, before_date, debug=debug
+        ids["podcast_clarification_id"], after_date, before_date, debug=debug, api_key=api_key
     )
 
     channel_stats: dict[str, dict] = defaultdict(lambda: {"mentions": 0, "revenue": 0.0, "by_month": defaultdict(lambda: {"mentions": 0, "revenue": 0.0})})
@@ -850,6 +922,7 @@ def get_podcast_performance(
     before_date: str = None,
     rate_overrides: dict = None,
     debug: bool = False,
+    ctx: Context = None,
 ) -> dict:
     """
     Get performance stats for a specific podcast.
@@ -865,10 +938,15 @@ def get_podcast_performance(
         rate_overrides: Optional dict to override response rates for this call only
         debug: If True, include pagination metadata
     """
-    err = _require_question_id("PODCAST_CLARIFICATION_QUESTION_ID", PODCAST_CLARIFICATION_QUESTION_ID)
+    api_key = _get_api_key(ctx)
+    if not api_key:
+        return {"error": "No API key provided. Pass via Authorization header or set FAIRING_API_KEY env var."}
+    ids = _get_question_ids(api_key)
+
+    err = _require_question_id("PODCAST_CLARIFICATION_QUESTION_ID", ids["podcast_clarification_id"])
     if err:
         return err
-    err = _require_question_id("MAIN_QUESTION_ID", MAIN_QUESTION_ID)
+    err = _require_question_id("MAIN_QUESTION_ID", ids["main_question_id"])
     if err:
         return err
 
@@ -878,7 +956,7 @@ def get_podcast_performance(
 
     # --- Source 1: Podcast clarification question ---
     pod_responses, pod_meta = fetch_all_responses(
-        PODCAST_CLARIFICATION_QUESTION_ID, after_date, before_date, debug=debug
+        ids["podcast_clarification_id"], after_date, before_date, debug=debug, api_key=api_key
     )
     all_aovs = [float(r["order_total"]) for r in pod_responses if r.get("order_total")]
     pod_matches = [
@@ -889,7 +967,7 @@ def get_podcast_performance(
 
     # --- Source 2: Main question "Other" free-text ---
     main_responses, main_meta = fetch_all_responses(
-        MAIN_QUESTION_ID, after_date, before_date, debug=debug
+        ids["main_question_id"], after_date, before_date, debug=debug, api_key=api_key
     )
     main_other_matches = [
         r for r in main_responses
@@ -1000,6 +1078,7 @@ def rank_instagram_channels(
     include_monthly_trend: bool = False,
     rate_overrides: dict = None,
     debug: bool = False,
+    ctx: Context = None,
 ) -> dict:
     """
     Rank all Instagram accounts by number of mentions or attributed revenue.
@@ -1011,7 +1090,12 @@ def rank_instagram_channels(
         rate_overrides: Optional dict to override response rates for this call only
         debug: If True, include pagination metadata
     """
-    err = _require_question_id("INSTAGRAM_CLARIFICATION_QUESTION_ID", INSTAGRAM_CLARIFICATION_QUESTION_ID)
+    api_key = _get_api_key(ctx)
+    if not api_key:
+        return {"error": "No API key provided. Pass via Authorization header or set FAIRING_API_KEY env var."}
+    ids = _get_question_ids(api_key)
+
+    err = _require_question_id("INSTAGRAM_CLARIFICATION_QUESTION_ID", ids["instagram_clarification_id"])
     if err:
         return err
 
@@ -1019,7 +1103,7 @@ def rank_instagram_channels(
     compound = _compound_rate(rates, "main_question", "instagram_clarification")
 
     responses, fetch_meta = fetch_all_responses(
-        INSTAGRAM_CLARIFICATION_QUESTION_ID, after_date, before_date, debug=debug
+        ids["instagram_clarification_id"], after_date, before_date, debug=debug, api_key=api_key
     )
 
     channel_stats: dict[str, dict] = defaultdict(lambda: {"mentions": 0, "revenue": 0.0, "by_month": defaultdict(lambda: {"mentions": 0, "revenue": 0.0})})
@@ -1103,6 +1187,7 @@ def get_instagram_channel_performance(
     before_date: str = None,
     rate_overrides: dict = None,
     debug: bool = False,
+    ctx: Context = None,
 ) -> dict:
     """
     Get performance stats for a specific Instagram account.
@@ -1119,10 +1204,15 @@ def get_instagram_channel_performance(
         rate_overrides: Optional dict to override response rates for this call only
         debug: If True, include pagination metadata
     """
-    err = _require_question_id("INSTAGRAM_CLARIFICATION_QUESTION_ID", INSTAGRAM_CLARIFICATION_QUESTION_ID)
+    api_key = _get_api_key(ctx)
+    if not api_key:
+        return {"error": "No API key provided. Pass via Authorization header or set FAIRING_API_KEY env var."}
+    ids = _get_question_ids(api_key)
+
+    err = _require_question_id("INSTAGRAM_CLARIFICATION_QUESTION_ID", ids["instagram_clarification_id"])
     if err:
         return err
-    err = _require_question_id("MAIN_QUESTION_ID", MAIN_QUESTION_ID)
+    err = _require_question_id("MAIN_QUESTION_ID", ids["main_question_id"])
     if err:
         return err
 
@@ -1132,7 +1222,7 @@ def get_instagram_channel_performance(
 
     # --- Source 1: Instagram clarification question ---
     ig_responses, ig_meta = fetch_all_responses(
-        INSTAGRAM_CLARIFICATION_QUESTION_ID, after_date, before_date, debug=debug
+        ids["instagram_clarification_id"], after_date, before_date, debug=debug, api_key=api_key
     )
     all_aovs = [float(r["order_total"]) for r in ig_responses if r.get("order_total")]
     ig_matches = [
@@ -1143,7 +1233,7 @@ def get_instagram_channel_performance(
 
     # --- Source 2: Main question "Other" free-text ---
     main_responses, main_meta = fetch_all_responses(
-        MAIN_QUESTION_ID, after_date, before_date, debug=debug
+        ids["main_question_id"], after_date, before_date, debug=debug, api_key=api_key
     )
     main_other_matches = [
         r for r in main_responses
@@ -1252,6 +1342,7 @@ def get_creator_performance(
     before_date: str = None,
     rate_overrides: dict = None,
     debug: bool = False,
+    ctx: Context = None,
 ) -> dict:
     """
     Search for a creator across YouTube, podcast, and Instagram clarification
@@ -1267,26 +1358,31 @@ def get_creator_performance(
         rate_overrides: Optional dict to override response rates for this call only
         debug: If True, include pagination metadata per platform
     """
+    api_key = _get_api_key(ctx)
+    if not api_key:
+        return {"error": "No API key provided. Pass via Authorization header or set FAIRING_API_KEY env var."}
+    ids = _get_question_ids(api_key)
+
     rates = _resolve_rates(rate_overrides)
 
     platform_configs = [
         {
             "platform": "youtube",
-            "question_id": YOUTUBE_CLARIFICATION_QUESTION_ID,
+            "question_id": ids["youtube_clarification_id"],
             "env_var": "YOUTUBE_CLARIFICATION_QUESTION_ID",
             "rate_keys": ("main_question", "youtube_clarification"),
             "compound_key": "youtube_clarification",
         },
         {
             "platform": "podcast",
-            "question_id": PODCAST_CLARIFICATION_QUESTION_ID,
+            "question_id": ids["podcast_clarification_id"],
             "env_var": "PODCAST_CLARIFICATION_QUESTION_ID",
             "rate_keys": ("main_question", "podcast_clarification"),
             "compound_key": "podcast_clarification",
         },
         {
             "platform": "instagram",
-            "question_id": INSTAGRAM_CLARIFICATION_QUESTION_ID,
+            "question_id": ids["instagram_clarification_id"],
             "env_var": "INSTAGRAM_CLARIFICATION_QUESTION_ID",
             "rate_keys": ("main_question", "instagram_clarification"),
             "compound_key": "instagram_clarification",
@@ -1313,7 +1409,7 @@ def get_creator_performance(
 
         compound = _compound_rate(rates, *cfg["rate_keys"])
         responses, fetch_meta = fetch_all_responses(
-            cfg["question_id"], after_date, before_date, debug=debug
+            cfg["question_id"], after_date, before_date, debug=debug, api_key=api_key
         )
 
         matches = [
