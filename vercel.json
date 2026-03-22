@@ -1,10 +1,9 @@
 {
-  "rewrites": [
-    { "source": "/mcp", "destination": "/api/index" }
+  "builds": [
+    { "src": "api/index.py", "use": "@vercel/python" }
   ],
-  "functions": {
-    "api/index.py": {
-      "maxDuration": 60
-    }
-  }
+  "routes": [
+    { "src": "/mcp(.*)", "dest": "api/index.py" },
+    { "src": "/(.*)", "dest": "api/index.py" }
+  ]
 }
